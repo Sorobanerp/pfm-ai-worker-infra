@@ -1,0 +1,6 @@
+apiVersion: v2
+name: pfm-ai-worker
+description: 1:1 Helm Chart + KEDA Kafka Scaler for pfm-ai-worker-python
+type: application
+version: 2.0.0
+appVersion: "2.0.0"

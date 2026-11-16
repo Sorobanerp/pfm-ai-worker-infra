@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pfm-ai-worker
+  namespace: pfm-platform
+  labels:
+    app: pfm-ai-worker
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: pfm-ai-worker
+  template:
+    metadata:
+      labels:
+        app: pfm-ai-worker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: pfm-ai-worker
+          image: ghcr.io/dantas-pfm/pfm-ai-worker-python:latest
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: pfm-ai-worker-config
+                  key: kafka_bootstrap_servers
+            - name: PFM_AI_RULES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: pfm-ai-worker-secrets
+                  key: pfm_ai_rules_dsn
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pfm-ai-worker-secrets
+                  key: gemini_api_key
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: pfm-ai-worker-kafka-scaler
+  namespace: pfm-platform
+spec:
+  scaleTargetRef:
+    name: pfm-ai-worker
+  pollingInterval: 10
+  cooldownPeriod: 60
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: pfm-kafka.pfm-platform.svc.cluster.local:9092
+        consumerGroup: pfm-ai-worker-group
+        topic: statement.raw.extracted
+        lagThreshold: "20"
+        activationLagThreshold: "1"
+        offsetResetPolicy: earliest
