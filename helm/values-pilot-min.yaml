@@ -1,0 +1,17 @@
+# FinOps Minimum Footprint for 5-User Family Pilot (KEDA Scale-to-Zero: 0 idle pods)
+replicaCount: 0
+
+keda:
+  enabled: true
+  minReplicaCount: 0
+  maxReplicaCount: 2
+  lagThreshold: 5
+  cooldownPeriod: 30
+
+resources:
+  requests:
+    cpu: "50m"
+    memory: "96Mi"
+  limits:
+    cpu: "200m"
+    memory: "160Mi"
