@@ -5,5 +5,6 @@ keda:
   maxReplicaCount: 4
   lagThreshold: 10
 env:
-  KAFKA_BOOTSTRAP_SERVERS: "localhost:9092"
-  PFM_AI_RULES_DSN: "postgresql://pfm_ai_user:pfm_ai_pass@localhost:5433/pfm_ai_rules"
+  WORKER_PORT: "18400"
+  KAFKA_BOOTSTRAP_SERVERS: "localhost:19092"
+  PFM_AI_RULES_DSN: "postgresql://pfm_ai_user:pfm_ai_pass@localhost:15433/pfm_ai_rules"
