@@ -21,6 +21,13 @@ spec:
       containers:
         - name: pfm-ai-worker
           image: ghcr.io/dantas-pfm/pfm-ai-worker-python:latest
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           env:
             - name: KAFKA_BOOTSTRAP_SERVERS
               valueFrom:
