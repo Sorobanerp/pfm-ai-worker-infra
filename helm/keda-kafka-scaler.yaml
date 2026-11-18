@@ -5,6 +5,9 @@ metadata:
   namespace: pfm-platform
   labels:
     app: pfm-ai-worker
+    tags.datadoghq.com/service: "pfm-ai-worker-python"
+    tags.datadoghq.com/env: "production"
+    tags.datadoghq.com/version: "0.1.0"
 spec:
   replicas: 0
   selector:
@@ -14,6 +17,9 @@ spec:
     metadata:
       labels:
         app: pfm-ai-worker
+        tags.datadoghq.com/service: "pfm-ai-worker-python"
+        tags.datadoghq.com/env: "production"
+        tags.datadoghq.com/version: "0.1.0"
     spec:
       securityContext:
         runAsNonRoot: true
@@ -21,6 +27,13 @@ spec:
       containers:
         - name: pfm-ai-worker
           image: ghcr.io/dantas-pfm/pfm-ai-worker-python:latest
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           env:
             - name: KAFKA_BOOTSTRAP_SERVERS
               valueFrom:
@@ -37,6 +50,18 @@ spec:
                 secretKeyRef:
                   name: pfm-ai-worker-secrets
                   key: gemini_api_key
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://datadog-agent.monitoring.svc.cluster.local:4318"
+            - name: OTEL_SERVICE_NAME
+              value: "pfm-ai-worker-python"
+            - name: DD_LOGS_INJECTION
+              value: "true"
+            - name: DD_SERVICE
+              value: "pfm-ai-worker-python"
+            - name: DD_ENV
+              value: "production"
+            - name: DD_VERSION
+              value: "0.1.0"
           resources:
             requests:
               cpu: "100m"

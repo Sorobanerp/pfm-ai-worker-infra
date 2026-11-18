@@ -19,17 +19,17 @@ resource "aws_secretsmanager_secret" "gemini_api_key" {
 }
 
 resource "aws_db_instance" "pfm_ai_rules" {
-  identifier              = "pfm-ai-rules-${var.environment}"
-  engine                  = "postgres"
-  engine_version          = "16.3"
-  instance_class          = "db.t4g.micro"
-  allocated_storage       = 20
-  db_name                 = "pfm_ai_rules"
-  port                    = 5433
-  username                = "pfm_ai_user"
+  identifier                  = "pfm-ai-rules-${var.environment}"
+  engine                      = "postgres"
+  engine_version              = "16.3"
+  instance_class              = "db.t4g.micro"
+  allocated_storage           = 20
+  db_name                     = "pfm_ai_rules"
+  port                        = 5433
+  username                    = "pfm_ai_user"
   manage_master_user_password = true
-  storage_encrypted       = true
-  skip_final_snapshot     = true
+  storage_encrypted           = true
+  skip_final_snapshot         = true
 }
 
 resource "aws_iam_role" "ai_worker_role" {
