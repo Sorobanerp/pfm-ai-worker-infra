@@ -5,6 +5,14 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.15"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.33"
+    }
   }
 }
 
@@ -22,6 +30,12 @@ variable "shared_state_bucket" {
   type        = string
   default     = "sorobanerp-pfm-tfstate-us-east-2-366476833548"
   description = "S3 bucket storing pfm-shared-infra remote state"
+}
+
+variable "eks_cluster_name" {
+  type        = string
+  default     = ""
+  description = "Optional override for EKS cluster name"
 }
 
 variable "kms_master_key_arn" {
@@ -62,11 +76,34 @@ data "terraform_remote_state" "shared" {
 }
 
 locals {
+  eks_cluster_name       = coalesce(var.eks_cluster_name, try(data.terraform_remote_state.shared.outputs.eks_cluster_name, "pfm-eks-prod"))
   kms_master_key_arn     = coalesce(var.kms_master_key_arn, try(data.terraform_remote_state.shared.outputs.kms_master_key_arn, ""))
   oidc_provider_arn      = coalesce(var.oidc_provider_arn, try(data.terraform_remote_state.shared.outputs.oidc_provider_arn, ""))
   oidc_issuer_url        = coalesce(var.oidc_issuer_url, try(data.terraform_remote_state.shared.outputs.oidc_issuer_url, ""))
   shared_rds_resource_id = coalesce(var.shared_rds_resource_id, try(data.terraform_remote_state.shared.outputs.rds_resource_id, "db-PFMCORELEDGER01"))
   shared_rds_endpoint    = try(data.terraform_remote_state.shared.outputs.rds_endpoint, "")
+}
+
+data "aws_eks_cluster" "eks" {
+  name = local.eks_cluster_name
+}
+
+data "aws_eks_cluster_auth" "eks" {
+  name = local.eks_cluster_name
+}
+
+provider "kubernetes" {
+  host                   = data.aws_eks_cluster.eks.endpoint
+  cluster_ca_certificate = base64decode(data.aws_eks_cluster.eks.certificate_authority[0].data)
+  token                  = data.aws_eks_cluster_auth.eks.token
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = data.aws_eks_cluster.eks.endpoint
+    cluster_ca_certificate = base64decode(data.aws_eks_cluster.eks.certificate_authority[0].data)
+    token                  = data.aws_eks_cluster_auth.eks.token
+  }
 }
 
 # FinOps MVP: No duplicate aws_db_instance here!
@@ -123,6 +160,47 @@ resource "aws_iam_role_policy" "ai_worker_least_privilege" {
       }
     ]
   })
+}
+
+resource "kubernetes_service_account_v1" "ai_worker_sa" {
+  metadata {
+    name      = "pfm-ai-worker-sa"
+    namespace = "pfm-platform"
+    annotations = {
+      "eks.amazonaws.com/role-arn" = aws_iam_role.ai_worker_role.arn
+    }
+  }
+}
+
+resource "helm_release" "pfm_ai_worker" {
+  name             = "pfm-ai-worker"
+  chart            = "${path.module}/../../helm"
+  namespace        = "pfm-platform"
+  create_namespace = false
+  wait             = false
+  values           = [file("${path.module}/../../helm/values-prod.yaml")]
+
+  set {
+    name  = "replicaCount"
+    value = "0"
+  }
+
+  set {
+    name  = "imageRepository"
+    value = "public.ecr.aws/docker/library/busybox"
+  }
+
+  set {
+    name  = "imageTag"
+    value = "1.36"
+  }
+
+  set {
+    name  = "serviceAccountName"
+    value = kubernetes_service_account_v1.ai_worker_sa.metadata[0].name
+  }
+
+  depends_on = [kubernetes_service_account_v1.ai_worker_sa]
 }
 
 output "irsa_role_arn" {

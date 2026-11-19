@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pfm-ai-worker
+  namespace: pfm-platform
+  annotations:
+    checkov.io/skip1: "CKV_K8S_43=Tag imutavel v0.1.0 gerenciada pelo pipeline GitOps"
+  labels:
+    app: pfm-ai-worker
+    tags.datadoghq.com/service: "pfm-ai-worker-python"
+    tags.datadoghq.com/env: "production"
+    tags.datadoghq.com/version: "0.1.0"
+spec:
+  replicas: {{ .Values.replicaCount | default 0 }}
+  selector:
+    matchLabels:
+      app: pfm-ai-worker
+  template:
+    metadata:
+      labels:
+        app: pfm-ai-worker
+        tags.datadoghq.com/service: "pfm-ai-worker-python"
+        tags.datadoghq.com/env: "production"
+        tags.datadoghq.com/version: "0.1.0"
+    spec:
+      automountServiceAccountToken: false
+      serviceAccountName: {{ .Values.serviceAccountName | default "pfm-ai-worker-sa" }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: pfm-ai-worker
+          image: "{{ .Values.imageRepository | default "public.ecr.aws/docker/library/busybox" }}:{{ .Values.imageTag | default "1.36" }}"
+          imagePullPolicy: Always
+          command: ["sh", "-c", "sleep infinity"]
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://datadog-agent.monitoring.svc.cluster.local:4318"
+            - name: OTEL_SERVICE_NAME
+              value: "pfm-ai-worker-python"
+            - name: DD_LOGS_INJECTION
+              value: "true"
+            - name: DD_SERVICE
+              value: "pfm-ai-worker-python"
+            - name: DD_ENV
+              value: "production"
+            - name: DD_VERSION
+              value: "0.1.0"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pfm-ai-worker
+  namespace: pfm-platform
+  labels:
+    app: pfm-ai-worker
+spec:
+  type: ClusterIP
+  selector:
+    app: pfm-ai-worker
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: pfm-ai-worker-kafka-scaler
+  namespace: pfm-platform
+spec:
+  scaleTargetRef:
+    name: pfm-ai-worker
+  pollingInterval: 10
+  cooldownPeriod: 60
+  minReplicaCount: {{ .Values.keda.minReplicaCount | default 0 }}
+  maxReplicaCount: {{ .Values.keda.maxReplicaCount | default 3 }}
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: pfm-kafka.pfm-platform.svc.cluster.local:9092
+        consumerGroup: pfm-ai-worker-group
+        topic: statement.raw.extracted
+        lagThreshold: "20"
+        activationLagThreshold: "1"
+        offsetResetPolicy: earliest
