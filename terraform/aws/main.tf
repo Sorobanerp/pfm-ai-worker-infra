@@ -62,6 +62,25 @@ variable "shared_rds_resource_id" {
   description = "Optional override for shared PostgreSQL 16 RDS resource ID from pfm-shared-infra"
 }
 
+variable "kafka_bootstrap_servers" {
+  type        = string
+  default     = ""
+  description = "Upstash Kafka Serverless bootstrap servers (injected in Wave 3; empty pauses KEDA polling cleanly at 0 replicas)"
+}
+
+variable "kafka_sasl_username" {
+  type        = string
+  default     = "upstash-placeholder"
+  description = "Upstash Kafka SASL username"
+}
+
+variable "kafka_sasl_password" {
+  type        = string
+  default     = "placeholder-wave3"
+  sensitive   = true
+  description = "Upstash Kafka SASL password"
+}
+
 provider "aws" {
   region = var.aws_region
 }
@@ -172,6 +191,22 @@ resource "kubernetes_service_account_v1" "ai_worker_sa" {
   }
 }
 
+resource "kubernetes_secret_v1" "kafka_credentials" {
+  metadata {
+    name      = "pfm-kafka-credentials"
+    namespace = "pfm-platform"
+  }
+
+  data = {
+    sasl     = "scram_sha256"
+    tls      = "enable"
+    username = var.kafka_sasl_username
+    password = var.kafka_sasl_password
+  }
+
+  type = "Opaque"
+}
+
 resource "helm_release" "pfm_ai_worker" {
   name             = "pfm-ai-worker"
   chart            = "${path.module}/../../helm"
@@ -200,7 +235,15 @@ resource "helm_release" "pfm_ai_worker" {
     value = kubernetes_service_account_v1.ai_worker_sa.metadata[0].name
   }
 
-  depends_on = [kubernetes_service_account_v1.ai_worker_sa]
+  set {
+    name  = "kafkaBootstrapServers"
+    value = var.kafka_bootstrap_servers
+  }
+
+  depends_on = [
+    kubernetes_service_account_v1.ai_worker_sa,
+    kubernetes_secret_v1.kafka_credentials
+  ]
 }
 
 output "irsa_role_arn" {
