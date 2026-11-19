@@ -2,7 +2,7 @@ replicaCount: 0
 keda:
   enabled: true
   minReplicaCount: 0
-  maxReplicaCount: 10
+  maxReplicaCount: 3
   lagThreshold: 20
 resources:
   requests:
