@@ -107,7 +107,7 @@ metadata:
   namespace: pfm-platform
   {{- if not .Values.kafkaBootstrapServers }}
   annotations:
-    autoscaling.keda.sh/paused-replicas: "0"
+    autoscaling.keda.sh/paused: "true"
   {{- end }}
 spec:
   scaleTargetRef:
