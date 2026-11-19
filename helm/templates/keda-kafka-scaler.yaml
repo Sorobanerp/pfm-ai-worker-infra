@@ -81,21 +81,48 @@ spec:
       protocol: TCP
 ---
 apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: pfm-kafka-trigger-auth
+  namespace: pfm-platform
+spec:
+  secretTargetRef:
+    - parameter: sasl
+      name: pfm-kafka-credentials
+      key: sasl
+    - parameter: username
+      name: pfm-kafka-credentials
+      key: username
+    - parameter: password
+      name: pfm-kafka-credentials
+      key: password
+    - parameter: tls
+      name: pfm-kafka-credentials
+      key: tls
+---
+apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
   name: pfm-ai-worker-kafka-scaler
   namespace: pfm-platform
+  {{- if not .Values.kafkaBootstrapServers }}
+  annotations:
+    autoscaling.keda.sh/paused-replicas: "0"
+  {{- end }}
 spec:
   scaleTargetRef:
     name: pfm-ai-worker
-  pollingInterval: 10
+  pollingInterval: 30
   cooldownPeriod: 60
+  idleReplicaCount: 0
   minReplicaCount: {{ .Values.keda.minReplicaCount | default 0 }}
   maxReplicaCount: {{ .Values.keda.maxReplicaCount | default 3 }}
   triggers:
     - type: kafka
+      authenticationRef:
+        name: pfm-kafka-trigger-auth
       metadata:
-        bootstrapServers: pfm-kafka.pfm-platform.svc.cluster.local:9092
+        bootstrapServers: {{ .Values.kafkaBootstrapServers | default "upstash-kafka-placeholder.invalid:9092" | quote }}
         consumerGroup: pfm-ai-worker-group
         topic: statement.raw.extracted
         lagThreshold: "20"
