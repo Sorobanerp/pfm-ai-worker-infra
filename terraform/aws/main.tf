@@ -240,6 +240,11 @@ resource "helm_release" "pfm_ai_worker" {
     value = var.kafka_bootstrap_servers
   }
 
+  set {
+    name  = "chartChecksum"
+    value = filesha256("${path.module}/../../helm/templates/keda-kafka-scaler.yaml")
+  }
+
   depends_on = [
     kubernetes_service_account_v1.ai_worker_sa,
     kubernetes_secret_v1.kafka_credentials
