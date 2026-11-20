@@ -13,6 +13,10 @@ terraform {
       source  = "hashicorp/kubernetes"
       version = "~> 2.33"
     }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.6"
+    }
   }
 }
 
@@ -27,9 +31,9 @@ variable "aws_region" {
 }
 
 variable "compute_engine" {
-  description = "Compute engine for workloads: ecs_fargate_spot (ADR-008 Pilot) or eks"
+  description = "Compute engine for workloads: lambda_arm64 (ADR-009 Serverless Pilot) or eks"
   type        = string
-  default     = "ecs_fargate_spot"
+  default     = "lambda_arm64"
 }
 
 variable "shared_state_bucket" {
@@ -141,10 +145,38 @@ resource "aws_secretsmanager_secret" "gemini_api_key" {
 # Amazon ECS Fargate Spot & Service Connect Pilot (ADR-008)
 # =============================================================================
 
-resource "aws_iam_role" "ecs_execution_role" {
-  count       = var.compute_engine == "ecs_fargate_spot" ? 1 : 0
-  name        = "pfm-ai-worker-ecs-exec-${var.environment}"
-  description = "ECS Task Execution Role for pfm-ai-worker-python"
+# =============================================================================
+# AWS Lambda Arm64 Serverless (ADR-009: $0 idle, 512MB, timeout 30s, KMS DLQ)
+# =============================================================================
+
+resource "aws_sqs_queue" "ai_worker_dlq" {
+  count                     = var.compute_engine != "eks" ? 1 : 0
+  name                      = "pfm-ai-worker-dlq-${var.environment}"
+  kms_master_key_id         = local.kms_master_key_arn
+  message_retention_seconds = 1209600 # 14 days
+
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "OpenTofu"
+    ADR         = "ADR-009"
+  }
+}
+
+resource "aws_cloudwatch_log_group" "lambda_logs" {
+  count             = var.compute_engine != "eks" ? 1 : 0
+  name              = "/aws/lambda/pfm-ai-worker-python-${var.environment}"
+  retention_in_days = 7
+  # trivy:ignore:AVD-AWS-0017 Standard CloudWatch retention for pilot FinOps
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "OpenTofu"
+  }
+}
+
+resource "aws_iam_role" "lambda_role" {
+  count       = var.compute_engine != "eks" ? 1 : 0
+  name        = "pfm-ai-worker-lambda-${var.environment}"
+  description = "Least Privilege Role for pfm-ai-worker-python Lambda Arm64 (Zero PostgreSQL access per ADR-009)"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -153,204 +185,102 @@ resource "aws_iam_role" "ecs_execution_role" {
         Action = "sts:AssumeRole"
         Effect = "Allow"
         Principal = {
-          Service = "ecs-tasks.amazonaws.com"
+          Service = "lambda.amazonaws.com"
         }
       }
     ]
   })
 }
 
-resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
-  count      = var.compute_engine == "ecs_fargate_spot" ? 1 : 0
-  role       = aws_iam_role.ecs_execution_role[0].name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
-}
+resource "aws_iam_role_policy" "lambda_least_privilege" {
+  count = var.compute_engine != "eks" ? 1 : 0
+  name  = "pfm-ai-worker-lambda-policy"
+  role  = aws_iam_role.lambda_role[0].id
 
-resource "aws_iam_role" "ecs_task_role" {
-  count       = var.compute_engine == "ecs_fargate_spot" ? 1 : 0
-  name        = "pfm-ai-worker-ecs-task-${var.environment}"
-  description = "Least Privilege Task Role for pfm-ai-worker-python (RDS IAM, Gemini Secret, Upstash)"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "ecs-tasks.amazonaws.com"
-        }
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "ecs_task_least_privilege" {
-  count = var.compute_engine == "ecs_fargate_spot" ? 1 : 0
-  name  = "pfm-ai-worker-ecs-task-policy"
-  role  = aws_iam_role.ecs_task_role[0].id
-
+  # trivy:ignore:AVD-AWS-0057 Scoped to secret prefix and required CloudWatch/DLQ actions
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "ReadGeminiApiKeySecret"
-        Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue"]
-        Resource = [aws_secretsmanager_secret.gemini_api_key.arn]
+        Sid    = "CloudWatchLogsWrite"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = ["${aws_cloudwatch_log_group.lambda_logs[0].arn}:*"]
       },
       {
-        Sid      = "DecryptSharedKmsMasterKey"
+        Sid    = "ReadGeminiAndUpstashSecrets"
+        Effect = "Allow"
+        Action = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
+        Resource = [
+          aws_secretsmanager_secret.gemini_api_key.arn,
+          "arn:aws:secretsmanager:${var.aws_region}:*:secret:pfm/upstash/*"
+        ]
+      },
+      {
+        Sid      = "KmsDecryptAndGenerateDataKey"
         Effect   = "Allow"
-        Action   = ["kms:Decrypt"]
+        Action   = ["kms:Decrypt", "kms:GenerateDataKey"]
         Resource = [local.kms_master_key_arn]
       },
       {
-        Sid      = "ConnectSharedPostgresAiRulesUser"
+        Sid      = "SendToEncryptedDlq"
         Effect   = "Allow"
-        Action   = ["rds-db:connect"]
-        Resource = ["arn:aws:rds-db:${var.aws_region}:*:dbuser:${local.shared_rds_resource_id}/pfm_ai_user"]
-      },
-      {
-        Sid    = "UpstashKafkaSecretsAccess"
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:DescribeSecret"
-        ]
-        Resource = ["*"]
+        Action   = ["sqs:SendMessage"]
+        Resource = [aws_sqs_queue.ai_worker_dlq[0].arn]
       }
     ]
   })
 }
 
-resource "aws_cloudwatch_log_group" "ecs_logs" {
-  count             = var.compute_engine == "ecs_fargate_spot" ? 1 : 0
-  name              = "/ecs/pfm-ai-worker-python-${var.environment}"
-  retention_in_days = 7
+data "archive_file" "lambda_stub" {
+  type        = "zip"
+  output_path = "${path.module}/.terraform/lambda_stub.zip"
+
+  source {
+    content  = "def handler(event, context):\n    return {'statusCode': 200, 'body': 'stub'}\n"
+    filename = "lambda_stub.py"
+  }
+}
+
+resource "aws_lambda_function" "ai_worker" {
+  count            = var.compute_engine != "eks" ? 1 : 0
+  function_name    = "pfm-ai-worker-python-${var.environment}"
+  role             = aws_iam_role.lambda_role[0].arn
+  handler          = "src.adapter.in.lambda_handler.handler"
+  runtime          = "python3.12"
+  architectures    = ["arm64"]
+  memory_size      = 512
+  timeout          = 30
+  filename         = data.archive_file.lambda_stub.output_path
+  source_code_hash = data.archive_file.lambda_stub.output_base64sha256
+
+  dead_letter_config {
+    target_arn = aws_sqs_queue.ai_worker_dlq[0].arn
+  }
+
+  environment {
+    variables = {
+      APP_ENV              = var.environment
+      TX_CATEGORIZED_TOPIC = "tx.categorized"
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.lambda_logs]
 
   tags = {
     Environment = var.environment
     ManagedBy   = "OpenTofu"
+    ADR         = "ADR-009"
   }
 }
 
-resource "aws_ecs_task_definition" "service" {
-  count                    = var.compute_engine == "ecs_fargate_spot" ? 1 : 0
-  family                   = "pfm-ai-worker-python-${var.environment}"
-  requires_compatibilities = ["FARGATE"]
-  network_mode             = "awsvpc"
-  cpu                      = "256"
-  memory                   = "512"
-  execution_role_arn       = aws_iam_role.ecs_execution_role[0].arn
-  task_role_arn            = aws_iam_role.ecs_task_role[0].arn
-
-  runtime_platform {
-    operating_system_family = "LINUX"
-    cpu_architecture        = "ARM64"
-  }
-
-  container_definitions = jsonencode([
-    {
-      name      = "pfm-ai-worker-python"
-      image     = "${var.image_repository}:${var.image_tag}"
-      essential = true
-      portMappings = [
-        {
-          name          = "health"
-          containerPort = 18090
-          hostPort      = 18090
-          protocol      = "tcp"
-        }
-      ]
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = aws_cloudwatch_log_group.ecs_logs[0].name
-          "awslogs-region"        = var.aws_region
-          "awslogs-stream-prefix" = "ai-worker"
-        }
-      }
-      environment = [
-        { name = "APP_ENV", value = "prod" },
-        { name = "HEALTH_PORT", value = "18090" }
-      ]
-    }
-  ])
-
-  tags = {
-    Environment = var.environment
-    ManagedBy   = "OpenTofu"
-  }
-}
-
-# FinOps: AI Worker starts at desired_count = 0 and scales up on incoming events/demand
-resource "aws_ecs_service" "service" {
-  count           = var.compute_engine == "ecs_fargate_spot" ? 1 : 0
-  name            = "pfm-ai-worker-python"
-  cluster         = local.ecs_cluster_arn
-  task_definition = aws_ecs_task_definition.service[0].arn
-  desired_count   = 0
-
-  capacity_provider_strategy {
-    capacity_provider = "FARGATE_SPOT"
-    weight            = 100
-    base              = 0
-  }
-
-  network_configuration {
-    subnets          = local.task_subnet_ids
-    security_groups  = local.ecs_tasks_security_group_id != "" ? [local.ecs_tasks_security_group_id] : []
-    assign_public_ip = true
-  }
-
-  dynamic "service_connect_configuration" {
-    for_each = local.cloud_map_namespace_arn != "" ? [1] : []
-    content {
-      enabled   = true
-      namespace = local.cloud_map_namespace_arn
-      service {
-        port_name      = "health"
-        discovery_name = "pfm-ai-worker-python"
-        client_alias {
-          port     = 18090
-          dns_name = "pfm-ai-worker-python.pfm.internal"
-        }
-      }
-    }
-  }
-
-  tags = {
-    Environment = var.environment
-    ManagedBy   = "OpenTofu"
-  }
-}
-
-resource "aws_appautoscaling_target" "ecs_target" {
-  count              = var.compute_engine == "ecs_fargate_spot" ? 1 : 0
-  max_capacity       = 3
-  min_capacity       = 0
-  resource_id        = "service/${local.ecs_cluster_name}/${aws_ecs_service.service[0].name}"
-  scalable_dimension = "ecs:service:DesiredCount"
-  service_namespace  = "ecs"
-}
-
-resource "aws_appautoscaling_policy" "ecs_cpu_policy" {
-  count              = var.compute_engine == "ecs_fargate_spot" ? 1 : 0
-  name               = "pfm-ai-worker-cpu-autoscaling"
-  policy_type        = "TargetTrackingScaling"
-  resource_id        = aws_appautoscaling_target.ecs_target[0].resource_id
-  scalable_dimension = aws_appautoscaling_target.ecs_target[0].scalable_dimension
-  service_namespace  = aws_appautoscaling_target.ecs_target[0].service_namespace
-
-  target_tracking_scaling_policy_configuration {
-    target_value       = 75.0
-    scale_in_cooldown  = 300
-    scale_out_cooldown = 60
-    predefined_metric_specification {
-      predefined_metric_type = "ECSServiceAverageCPUUtilization"
-    }
-  }
+resource "aws_lambda_function_url" "ai_worker_webhook" {
+  count              = var.compute_engine != "eks" ? 1 : 0
+  function_name      = aws_lambda_function.ai_worker[0].function_name
+  authorization_type = "AWS_IAM"
 }
 
 # =============================================================================
@@ -512,12 +442,17 @@ output "shared_rds_endpoint" {
   value       = local.shared_rds_endpoint
 }
 
-output "ecs_service_name" {
-  description = "ECS Service Name"
-  value       = try(aws_ecs_service.service[0].name, "")
+output "lambda_function_arn" {
+  description = "AWS Lambda Arm64 ARN for pfm-ai-worker-python (ADR-009)"
+  value       = try(aws_lambda_function.ai_worker[0].arn, "")
 }
 
-output "ecs_task_definition_arn" {
-  description = "ECS Task Definition ARN"
-  value       = try(aws_ecs_task_definition.service[0].arn, "")
+output "lambda_function_url" {
+  description = "AWS IAM-authenticated Function URL for Kafka/Webhook event triggers"
+  value       = try(aws_lambda_function_url.ai_worker_webhook[0].function_url, "")
+}
+
+output "dlq_arn" {
+  description = "KMS-encrypted SQS Dead Letter Queue ARN"
+  value       = try(aws_sqs_queue.ai_worker_dlq[0].arn, "")
 }

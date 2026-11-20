@@ -6,7 +6,11 @@ Todas as alterações notáveis neste repositório são documentadas neste arqui
 
 ## [Unreleased]
 
+### Changed
+- Conversão da infraestrutura do Worker IA (`terraform/aws/main.tf`) para **AWS Lambda Arm64** (`python3.12`, `512MB`, `timeout = 30s`, `src.adapter.in.lambda_handler.handler`) conforme **ADR-009**, com custo \$0 ocioso e remoção de permissões RDS/PostgreSQL.
+
 ### Added
+- Dead Letter Queue SQS cifrada via KMS (`aws_sqs_queue.ai_worker_dlq`), Lambda Function URL autenticada por `AWS_IAM` para triggers de webhook/Kafka e IAM Least Privilege.
 - Padronização de governança DevEx (`README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`) e workflow de validação de **Conventional Commits** em Pull Requests para `develop` e `main`.
 
 ---
