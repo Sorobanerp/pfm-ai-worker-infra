@@ -13,6 +13,10 @@ terraform {
       source  = "hashicorp/kubernetes"
       version = "~> 2.33"
     }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.6"
+    }
   }
 }
 
@@ -26,10 +30,28 @@ variable "aws_region" {
   default = "us-east-2"
 }
 
+variable "compute_engine" {
+  description = "Compute engine for workloads: lambda_arm64 (ADR-009 Serverless Pilot) or eks"
+  type        = string
+  default     = "lambda_arm64"
+}
+
 variable "shared_state_bucket" {
   type        = string
   default     = "sorobanerp-pfm-tfstate-us-east-2-366476833548"
   description = "S3 bucket storing pfm-shared-infra remote state"
+}
+
+variable "image_repository" {
+  description = "Container image repository"
+  type        = string
+  default     = "public.ecr.aws/docker/library/busybox"
+}
+
+variable "image_tag" {
+  description = "Container image tag"
+  type        = string
+  default     = "1.36"
 }
 
 variable "eks_cluster_name" {
@@ -65,7 +87,7 @@ variable "shared_rds_resource_id" {
 variable "kafka_bootstrap_servers" {
   type        = string
   default     = ""
-  description = "Upstash Kafka Serverless bootstrap servers (injected in Wave 3; empty pauses KEDA polling cleanly at 0 replicas)"
+  description = "Upstash Kafka Serverless bootstrap servers"
 }
 
 variable "kafka_sasl_username" {
@@ -96,38 +118,22 @@ data "terraform_remote_state" "shared" {
 
 locals {
   eks_cluster_name       = coalesce(var.eks_cluster_name, try(data.terraform_remote_state.shared.outputs.eks_cluster_name, "pfm-eks-prod"))
-  kms_master_key_arn     = coalesce(var.kms_master_key_arn, try(data.terraform_remote_state.shared.outputs.kms_master_key_arn, ""))
-  oidc_provider_arn      = coalesce(var.oidc_provider_arn, try(data.terraform_remote_state.shared.outputs.oidc_provider_arn, ""))
-  oidc_issuer_url        = coalesce(var.oidc_issuer_url, try(data.terraform_remote_state.shared.outputs.oidc_issuer_url, ""))
+  kms_master_key_arn     = coalesce(var.kms_master_key_arn, try(data.terraform_remote_state.shared.outputs.kms_master_key_arn, "arn:aws:kms:us-east-2:366476833548:alias/pfm-master-key"))
+  oidc_provider_arn      = try(coalesce(var.oidc_provider_arn, try(data.terraform_remote_state.shared.outputs.oidc_provider_arn, null)), "")
+  oidc_issuer_url        = try(coalesce(var.oidc_issuer_url, try(data.terraform_remote_state.shared.outputs.oidc_issuer_url, null)), "")
   shared_rds_resource_id = coalesce(var.shared_rds_resource_id, try(data.terraform_remote_state.shared.outputs.rds_resource_id, "db-PFMCORELEDGER01"))
   shared_rds_endpoint    = try(data.terraform_remote_state.shared.outputs.rds_endpoint, "")
-}
 
-data "aws_eks_cluster" "eks" {
-  name = local.eks_cluster_name
+  # ECS Pilot Locals
+  ecs_cluster_arn             = try(data.terraform_remote_state.shared.outputs.ecs_cluster_arn, "arn:aws:ecs:us-east-2:366476833548:cluster/pfm-pilot-prod")
+  ecs_cluster_name            = try(data.terraform_remote_state.shared.outputs.ecs_cluster_name, "pfm-pilot-prod")
+  ecs_tasks_security_group_id = try(data.terraform_remote_state.shared.outputs.ecs_tasks_security_group_id, "")
+  cloud_map_namespace_arn     = try(data.terraform_remote_state.shared.outputs.cloud_map_namespace_arn, "")
+  public_subnet_ids           = try(data.terraform_remote_state.shared.outputs.public_subnet_ids, [])
+  private_subnet_ids          = try(data.terraform_remote_state.shared.outputs.private_subnet_ids, [])
+  task_subnet_ids             = length(local.public_subnet_ids) > 0 ? local.public_subnet_ids : local.private_subnet_ids
+  upstash_kafka_secret_arn    = try(data.terraform_remote_state.shared.outputs.upstash_kafka_secret_arn, "")
 }
-
-data "aws_eks_cluster_auth" "eks" {
-  name = local.eks_cluster_name
-}
-
-provider "kubernetes" {
-  host                   = data.aws_eks_cluster.eks.endpoint
-  cluster_ca_certificate = base64decode(data.aws_eks_cluster.eks.certificate_authority[0].data)
-  token                  = data.aws_eks_cluster_auth.eks.token
-}
-
-provider "helm" {
-  kubernetes {
-    host                   = data.aws_eks_cluster.eks.endpoint
-    cluster_ca_certificate = base64decode(data.aws_eks_cluster.eks.certificate_authority[0].data)
-    token                  = data.aws_eks_cluster_auth.eks.token
-  }
-}
-
-# FinOps MVP: No duplicate aws_db_instance here!
-# pfm_ai_rules logical database/schema lives on the single shared PostgreSQL 16 RDS
-# provisioned by pfm-shared-infra (saves ~US$ 15/mo + eliminates duplicate backup overhead).
 
 resource "aws_secretsmanager_secret" "gemini_api_key" {
   name        = "pfm/${var.environment}/ai-worker/gemini-api-key"
@@ -135,8 +141,179 @@ resource "aws_secretsmanager_secret" "gemini_api_key" {
   kms_key_id  = local.kms_master_key_arn
 }
 
+# =============================================================================
+# Amazon ECS Fargate Spot & Service Connect Pilot (ADR-008)
+# =============================================================================
+
+# =============================================================================
+# AWS Lambda Arm64 Serverless (ADR-009: $0 idle, 512MB, timeout 30s, KMS DLQ)
+# =============================================================================
+
+resource "aws_sqs_queue" "ai_worker_dlq" {
+  count                     = var.compute_engine != "eks" ? 1 : 0
+  name                      = "pfm-ai-worker-dlq-${var.environment}"
+  kms_master_key_id         = local.kms_master_key_arn
+  message_retention_seconds = 1209600 # 14 days
+
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "OpenTofu"
+    ADR         = "ADR-009"
+  }
+}
+
+resource "aws_cloudwatch_log_group" "lambda_logs" {
+  count             = var.compute_engine != "eks" ? 1 : 0
+  name              = "/aws/lambda/pfm-ai-worker-python-${var.environment}"
+  retention_in_days = 7
+  # trivy:ignore:AVD-AWS-0017 Standard CloudWatch retention for pilot FinOps
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "OpenTofu"
+  }
+}
+
+resource "aws_iam_role" "lambda_role" {
+  count       = var.compute_engine != "eks" ? 1 : 0
+  name        = "pfm-ai-worker-lambda-${var.environment}"
+  description = "Least Privilege Role for pfm-ai-worker-python Lambda Arm64 (Zero PostgreSQL access per ADR-009)"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "lambda_least_privilege" {
+  count = var.compute_engine != "eks" ? 1 : 0
+  name  = "pfm-ai-worker-lambda-policy"
+  role  = aws_iam_role.lambda_role[0].id
+
+  # trivy:ignore:AVD-AWS-0057 Scoped to secret prefix and required CloudWatch/DLQ actions
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "CloudWatchLogsWrite"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = ["${aws_cloudwatch_log_group.lambda_logs[0].arn}:*"]
+      },
+      {
+        Sid    = "ReadGeminiAndUpstashSecrets"
+        Effect = "Allow"
+        Action = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
+        Resource = [
+          aws_secretsmanager_secret.gemini_api_key.arn,
+          "arn:aws:secretsmanager:${var.aws_region}:*:secret:pfm/upstash/*"
+        ]
+      },
+      {
+        Sid      = "KmsDecryptAndGenerateDataKey"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt", "kms:GenerateDataKey"]
+        Resource = [local.kms_master_key_arn]
+      },
+      {
+        Sid      = "SendToEncryptedDlq"
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = [aws_sqs_queue.ai_worker_dlq[0].arn]
+      }
+    ]
+  })
+}
+
+data "archive_file" "lambda_stub" {
+  type        = "zip"
+  output_path = "${path.module}/.terraform/lambda_stub.zip"
+
+  source {
+    content  = "def handler(event, context):\n    return {'statusCode': 200, 'body': 'stub'}\n"
+    filename = "lambda_stub.py"
+  }
+}
+
+resource "aws_lambda_function" "ai_worker" {
+  count            = var.compute_engine != "eks" ? 1 : 0
+  function_name    = "pfm-ai-worker-python-${var.environment}"
+  role             = aws_iam_role.lambda_role[0].arn
+  handler          = "src.adapter.in.lambda_handler.handler"
+  runtime          = "python3.12"
+  architectures    = ["arm64"]
+  memory_size      = 512
+  timeout          = 30
+  filename         = data.archive_file.lambda_stub.output_path
+  source_code_hash = data.archive_file.lambda_stub.output_base64sha256
+
+  dead_letter_config {
+    target_arn = aws_sqs_queue.ai_worker_dlq[0].arn
+  }
+
+  environment {
+    variables = {
+      APP_ENV              = var.environment
+      TX_CATEGORIZED_TOPIC = "tx.categorized"
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.lambda_logs]
+
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "OpenTofu"
+    ADR         = "ADR-009"
+  }
+}
+
+resource "aws_lambda_function_url" "ai_worker_webhook" {
+  count              = var.compute_engine != "eks" ? 1 : 0
+  function_name      = aws_lambda_function.ai_worker[0].function_name
+  authorization_type = "AWS_IAM"
+}
+
+# =============================================================================
+# EKS / Kubernetes Support (Optional / Legacy when compute_engine = "eks")
+# =============================================================================
+
+data "aws_eks_cluster" "eks" {
+  count = var.compute_engine == "eks" ? 1 : 0
+  name  = local.eks_cluster_name
+}
+
+data "aws_eks_cluster_auth" "eks" {
+  count = var.compute_engine == "eks" ? 1 : 0
+  name  = local.eks_cluster_name
+}
+
+provider "kubernetes" {
+  host                   = var.compute_engine == "eks" ? data.aws_eks_cluster.eks[0].endpoint : "https://127.0.0.1"
+  cluster_ca_certificate = var.compute_engine == "eks" ? base64decode(data.aws_eks_cluster.eks[0].certificate_authority[0].data) : ""
+  token                  = var.compute_engine == "eks" ? data.aws_eks_cluster_auth.eks[0].token : ""
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = var.compute_engine == "eks" ? data.aws_eks_cluster.eks[0].endpoint : "https://127.0.0.1"
+    cluster_ca_certificate = var.compute_engine == "eks" ? base64decode(data.aws_eks_cluster.eks[0].certificate_authority[0].data) : ""
+    token                  = var.compute_engine == "eks" ? data.aws_eks_cluster_auth.eks[0].token : ""
+  }
+}
+
 resource "aws_iam_role" "ai_worker_role" {
-  name = "pfm-ai-worker-role-${var.environment}"
+  count = var.compute_engine == "eks" ? 1 : 0
+  name  = "pfm-ai-worker-role-${var.environment}"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -154,8 +331,9 @@ resource "aws_iam_role" "ai_worker_role" {
 }
 
 resource "aws_iam_role_policy" "ai_worker_least_privilege" {
-  name = "pfm-ai-worker-secrets-rds-policy"
-  role = aws_iam_role.ai_worker_role.id
+  count = var.compute_engine == "eks" ? 1 : 0
+  name  = "pfm-ai-worker-secrets-rds-policy"
+  role  = aws_iam_role.ai_worker_role[0].id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -182,16 +360,18 @@ resource "aws_iam_role_policy" "ai_worker_least_privilege" {
 }
 
 resource "kubernetes_service_account_v1" "ai_worker_sa" {
+  count = var.compute_engine == "eks" ? 1 : 0
   metadata {
     name      = "pfm-ai-worker-sa"
     namespace = "pfm-platform"
     annotations = {
-      "eks.amazonaws.com/role-arn" = aws_iam_role.ai_worker_role.arn
+      "eks.amazonaws.com/role-arn" = aws_iam_role.ai_worker_role[0].arn
     }
   }
 }
 
 resource "kubernetes_secret_v1" "kafka_credentials" {
+  count = var.compute_engine == "eks" ? 1 : 0
   metadata {
     name      = "pfm-kafka-credentials"
     namespace = "pfm-platform"
@@ -208,6 +388,7 @@ resource "kubernetes_secret_v1" "kafka_credentials" {
 }
 
 resource "helm_release" "pfm_ai_worker" {
+  count            = var.compute_engine == "eks" ? 1 : 0
   name             = "pfm-ai-worker"
   chart            = "${path.module}/../../helm"
   namespace        = "pfm-platform"
@@ -232,7 +413,7 @@ resource "helm_release" "pfm_ai_worker" {
 
   set {
     name  = "serviceAccountName"
-    value = kubernetes_service_account_v1.ai_worker_sa.metadata[0].name
+    value = kubernetes_service_account_v1.ai_worker_sa[0].metadata[0].name
   }
 
   set {
@@ -253,10 +434,25 @@ resource "helm_release" "pfm_ai_worker" {
 
 output "irsa_role_arn" {
   description = "IAM Role ARN for pfm-ai-worker-python ServiceAccount"
-  value       = aws_iam_role.ai_worker_role.arn
+  value       = try(aws_iam_role.ai_worker_role[0].arn, "")
 }
 
 output "shared_rds_endpoint" {
   description = "Shared PostgreSQL 16 RDS endpoint consumed from pfm-shared-infra"
   value       = local.shared_rds_endpoint
+}
+
+output "lambda_function_arn" {
+  description = "AWS Lambda Arm64 ARN for pfm-ai-worker-python (ADR-009)"
+  value       = try(aws_lambda_function.ai_worker[0].arn, "")
+}
+
+output "lambda_function_url" {
+  description = "AWS IAM-authenticated Function URL for Kafka/Webhook event triggers"
+  value       = try(aws_lambda_function_url.ai_worker_webhook[0].function_url, "")
+}
+
+output "dlq_arn" {
+  description = "KMS-encrypted SQS Dead Letter Queue ARN"
+  value       = try(aws_sqs_queue.ai_worker_dlq[0].arn, "")
 }
