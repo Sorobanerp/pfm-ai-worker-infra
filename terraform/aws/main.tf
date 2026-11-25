@@ -92,13 +92,13 @@ variable "kafka_bootstrap_servers" {
 
 variable "kafka_sasl_username" {
   type        = string
-  default     = "upstash-placeholder"
+  default     = ""
   description = "Upstash Kafka SASL username"
 }
 
 variable "kafka_sasl_password" {
   type        = string
-  default     = "placeholder-wave3"
+  default     = ""
   sensitive   = true
   description = "Upstash Kafka SASL password"
 }
@@ -162,8 +162,14 @@ resource "aws_sqs_queue" "ai_worker_dlq" {
   }
 }
 
+variable "enable_cloudwatch_logs" {
+  description = "Disable AWS CloudWatch Logs by default (FinOps ADR-010: use Datadog JSON stdout instead of CloudWatch)"
+  type        = bool
+  default     = false
+}
+
 resource "aws_cloudwatch_log_group" "lambda_logs" {
-  count             = var.compute_engine != "eks" ? 1 : 0
+  count             = var.compute_engine != "eks" && var.enable_cloudwatch_logs ? 1 : 0
   name              = "/aws/lambda/pfm-ai-worker-python-${var.environment}"
   retention_in_days = 7
   # trivy:ignore:AVD-AWS-0017 Standard CloudWatch retention for pilot FinOps
@@ -202,13 +208,14 @@ resource "aws_iam_role_policy" "lambda_least_privilege" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "CloudWatchLogsWrite"
-        Effect = "Allow"
+        Sid    = "CloudWatchLogsDisabledByDefault"
+        Effect = "Deny"
         Action = [
+          "logs:CreateLogGroup",
           "logs:CreateLogStream",
           "logs:PutLogEvents"
         ]
-        Resource = ["${aws_cloudwatch_log_group.lambda_logs[0].arn}:*"]
+        Resource = ["*"]
       },
       {
         Sid    = "ReadGeminiAndUpstashSecrets"
@@ -263,12 +270,11 @@ resource "aws_lambda_function" "ai_worker" {
 
   environment {
     variables = {
-      APP_ENV              = var.environment
-      TX_CATEGORIZED_TOPIC = "tx.categorized"
+      APP_ENV                 = var.environment
+      CLOUDWATCH_LOGS_ENABLED = "false"
+      TX_CATEGORIZED_TOPIC    = "tx.categorized"
     }
   }
-
-  depends_on = [aws_cloudwatch_log_group.lambda_logs]
 
   tags = {
     Environment = var.environment
