@@ -92,13 +92,13 @@ variable "kafka_bootstrap_servers" {
 
 variable "kafka_sasl_username" {
   type        = string
-  default     = "upstash-placeholder"
+  default     = ""
   description = "Upstash Kafka SASL username"
 }
 
 variable "kafka_sasl_password" {
   type        = string
-  default     = "placeholder-wave3"
+  default     = ""
   sensitive   = true
   description = "Upstash Kafka SASL password"
 }
