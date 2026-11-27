@@ -125,14 +125,15 @@ locals {
   shared_rds_endpoint    = try(data.terraform_remote_state.shared.outputs.rds_endpoint, "")
 
   # ECS Pilot Locals
-  ecs_cluster_arn             = try(data.terraform_remote_state.shared.outputs.ecs_cluster_arn, "arn:aws:ecs:us-east-2:366476833548:cluster/pfm-pilot-prod")
-  ecs_cluster_name            = try(data.terraform_remote_state.shared.outputs.ecs_cluster_name, "pfm-pilot-prod")
+  ecs_cluster_arn             = try(data.terraform_remote_state.shared.outputs.ecs_cluster_arn, "arn:aws:ecs:us-east-2:366476833548:cluster/pfm-ecs-pilot")
+  ecs_cluster_name            = try(data.terraform_remote_state.shared.outputs.ecs_cluster_name, "pfm-ecs-pilot")
   ecs_tasks_security_group_id = try(data.terraform_remote_state.shared.outputs.ecs_tasks_security_group_id, "")
   cloud_map_namespace_arn     = try(data.terraform_remote_state.shared.outputs.cloud_map_namespace_arn, "")
   public_subnet_ids           = try(data.terraform_remote_state.shared.outputs.public_subnet_ids, [])
   private_subnet_ids          = try(data.terraform_remote_state.shared.outputs.private_subnet_ids, [])
   task_subnet_ids             = length(local.public_subnet_ids) > 0 ? local.public_subnet_ids : local.private_subnet_ids
   upstash_kafka_secret_arn    = try(data.terraform_remote_state.shared.outputs.upstash_kafka_secret_arn, "")
+  datadog_api_key_secret_arn  = try(data.terraform_remote_state.shared.outputs.datadog_api_key_secret_arn, "arn:aws:secretsmanager:${var.aws_region}:*:secret:pfm/datadog/api-key-*")
 }
 
 resource "aws_secretsmanager_secret" "gemini_api_key" {
@@ -223,7 +224,8 @@ resource "aws_iam_role_policy" "lambda_least_privilege" {
         Action = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
         Resource = [
           aws_secretsmanager_secret.gemini_api_key.arn,
-          "arn:aws:secretsmanager:${var.aws_region}:*:secret:pfm/upstash/*"
+          "arn:aws:secretsmanager:${var.aws_region}:*:secret:pfm/upstash/*",
+          "arn:aws:secretsmanager:${var.aws_region}:*:secret:pfm/datadog/*"
         ]
       },
       {
@@ -270,9 +272,17 @@ resource "aws_lambda_function" "ai_worker" {
 
   environment {
     variables = {
-      APP_ENV                 = var.environment
-      CLOUDWATCH_LOGS_ENABLED = "false"
-      TX_CATEGORIZED_TOPIC    = "tx.categorized"
+      APP_ENV                     = var.environment
+      CLOUDWATCH_LOGS_ENABLED     = "false"
+      TX_CATEGORIZED_TOPIC        = "tx.categorized"
+      DD_SERVICE                  = "pfm-ai-worker-python"
+      DD_ENV                      = var.environment
+      DD_VERSION                  = var.image_tag
+      DD_LOGS_INJECTION           = "true"
+      DD_TRACE_SAMPLE_RATE        = "0.10"
+      DD_SITE                     = "us3.datadoghq.com"
+      OTEL_EXPORTER_OTLP_ENDPOINT = "https://otel-collector.pfm.internal:4318"
+      DD_CREDENTIAL_ARN           = local.datadog_api_key_secret_arn
     }
   }
 
