@@ -12,7 +12,7 @@ data "terraform_remote_state" "shared" {
 }
 
 locals {
-  kms_master_key_arn         = try(data.terraform_remote_state.shared.outputs.kms_master_key_arn, "arn:aws:kms:${var.aws_region}:366476833548:alias/pfm-master-key")
+  kms_master_key_arn         = try(data.terraform_remote_state.shared.outputs.kms_master_key_arn, "arn:aws:kms:${var.aws_region}:366476833548:alias/pfm-master-key-${var.environment}")
   datadog_api_key_secret_arn = try(data.terraform_remote_state.shared.outputs.datadog_api_key_secret_arn, "arn:aws:secretsmanager:${var.aws_region}:*:secret:pfm/${var.environment}/datadog/api-key-*")
 }
 
